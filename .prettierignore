@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.next-dev/
+
+# Generated files
+**/generated/**
+apps/claude-proxy/src/gen/**
+*.tsbuildinfo
+
+# Cache and temp
+.turbo/
+.cache/
+.history/
+
+# Test coverage
+coverage/
+
+# Lock files and logs
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+*.log
+
+# Other
+.DS_Store

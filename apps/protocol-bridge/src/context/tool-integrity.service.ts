@@ -1,0 +1,387 @@
+import { Injectable, Logger } from "@nestjs/common"
+import {
+  ToolPair,
+  UnifiedMessage,
+  isToolResultBlock,
+  isToolUseBlock,
+  normalizeContent,
+} from "./types"
+import { TokenCounterService } from "./token-counter.service"
+
+/**
+ * Tool Integrity Service
+ *
+ * Ensures tool_use and tool_result pairs remain intact during truncation.
+ * Supports both Anthropic format (content array with tool_use/tool_result blocks)
+ * and function-call style format (tool_calls field + separate tool role messages).
+ *
+ * Key features:
+ * - Extracts tool_use IDs from both formats
+ * - Extracts tool_result IDs from both formats
+ * - Validates tool pair integrity
+ * - Adjusts truncation point to avoid orphaned tools
+ */
+@Injectable()
+export class ToolIntegrityService {
+  private readonly logger = new Logger(ToolIntegrityService.name)
+
+  constructor(private readonly tokenCounter: TokenCounterService) {}
+
+  /**
+   * Extract all tool_use IDs from a message
+   * Handles both content-block and function-call style formats.
+   */
+  extractToolUseIds(message: UnifiedMessage): string[] {
+    const ids: string[] = []
+
+    // Check Anthropic format: tool_use blocks in content array
+    const contentBlocks = normalizeContent(message.content)
+    for (const block of contentBlocks) {
+      if (isToolUseBlock(block)) {
+        ids.push(block.id)
+      }
+    }
+
+    // Check function-call style: tool_calls field
+    if (message.tool_calls) {
+      for (const toolCall of message.tool_calls) {
+        if (toolCall.id) {
+          ids.push(toolCall.id)
+        }
+      }
+    }
+
+    return ids
+  }
+
+  /**
+   * Extract all tool_result IDs from a message
+   * Handles both content-block and function-call style formats.
+   */
+  extractToolResultIds(message: UnifiedMessage): string[] {
+    const ids: string[] = []
+
+    // Check Anthropic format: tool_result blocks in content array
+    const contentBlocks = normalizeContent(message.content)
+    for (const block of contentBlocks) {
+      if (isToolResultBlock(block)) {
+        ids.push(block.tool_use_id)
+      }
+    }
+
+    // Check function-call style: tool_call_id field
+    if (message.tool_call_id) {
+      ids.push(message.tool_call_id)
+    }
+
+    return ids
+  }
+
+  /**
+   * Check if a message contains any tool_use
+   */
+  hasToolUse(message: UnifiedMessage): boolean {
+    return this.extractToolUseIds(message).length > 0
+  }
+
+  /**
+   * Check if a message contains any tool_result
+   */
+  hasToolResult(message: UnifiedMessage): boolean {
+    return this.extractToolResultIds(message).length > 0
+  }
+
+  /**
+   * Build a map of all tool pairs in the message list
+   * Returns a map of tool_use_id -> ToolPair
+   */
+  buildToolPairMap(messages: UnifiedMessage[]): Map<string, ToolPair> {
+    const pairs = new Map<string, ToolPair>()
+
+    // First pass: find all tool_use
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]!
+      if (message.role !== "assistant") continue
+
+      const toolUseIds = this.extractToolUseIds(message)
+      for (const id of toolUseIds) {
+        // Extract tool name from content
+        let toolName = "unknown"
+        const contentBlocks = normalizeContent(message.content)
+        for (const block of contentBlocks) {
+          if (isToolUseBlock(block) && block.id === id) {
+            toolName = block.name
+            break
+          }
+        }
+        // Also check function-call style
+        if (message.tool_calls) {
+          for (const tc of message.tool_calls) {
+            if (tc.id === id) {
+              toolName = tc.function.name
+              break
+            }
+          }
+        }
+
+        pairs.set(id, {
+          tool_use_id: id,
+          tool_use_message_index: i,
+          tool_result_message_index: null,
+          tool_name: toolName,
+        })
+      }
+    }
+
+    // Second pass: find all tool_result and link to tool_use
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]!
+
+      const toolResultIds = this.extractToolResultIds(message)
+      for (const id of toolResultIds) {
+        const pair = pairs.get(id)
+        if (pair) {
+          pair.tool_result_message_index = i
+        } else {
+          // Orphaned tool_result (no corresponding tool_use)
+          this.logger.warn(`Orphaned tool_result found: ${id} at index ${i}`)
+        }
+      }
+    }
+
+    return pairs
+  }
+
+  /**
+   * Find all orphaned tool_results in the given messages
+   * (tool_results whose tool_use is NOT in the messages)
+   */
+  findOrphanedToolResults(
+    messages: UnifiedMessage[],
+    availableToolUseIds: Set<string>
+  ): Array<{ tool_use_id: string; message_index: number }> {
+    const orphans: Array<{ tool_use_id: string; message_index: number }> = []
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]!
+      const toolResultIds = this.extractToolResultIds(message)
+
+      for (const id of toolResultIds) {
+        if (!availableToolUseIds.has(id)) {
+          orphans.push({ tool_use_id: id, message_index: i })
+        }
+      }
+    }
+
+    return orphans
+  }
+
+  /**
+   * Find all orphaned tool_uses in the given messages
+   * (tool_uses whose tool_result is NOT in the messages)
+   */
+  findOrphanedToolUses(
+    messages: UnifiedMessage[],
+    availableToolResultIds: Set<string>
+  ): Array<{ tool_use_id: string; message_index: number }> {
+    const orphans: Array<{ tool_use_id: string; message_index: number }> = []
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]!
+      if (message.role !== "assistant") continue
+
+      const toolUseIds = this.extractToolUseIds(message)
+
+      for (const id of toolUseIds) {
+        if (!availableToolResultIds.has(id)) {
+          orphans.push({ tool_use_id: id, message_index: i })
+        }
+      }
+    }
+
+    return orphans
+  }
+
+  /**
+   * Find the optimal truncation point that maintains tool integrity
+   *
+   * Algorithm:
+   * 1. Start from the initial truncation point (based on token count)
+   * 2. Collect all tool_use IDs in the retained messages
+   * 3. Check if any retained user messages have orphaned tool_results
+   * 4. If yes, move the truncation point earlier to include the tool_use
+   * 5. Repeat until no orphaned tool_results exist
+   *
+   * @param messages All messages
+   * @param targetTokens Target token count for retained messages
+   * @returns The index to start from (messages.slice(index) will be retained)
+   */
+  findTruncationPointWithIntegrity(
+    messages: UnifiedMessage[],
+    targetTokens: number
+  ): number {
+    if (messages.length === 0) return 0
+
+    // Step 1: Find initial truncation point based on tokens
+    let truncationIndex = this.tokenCounter.findTruncationIndex(
+      messages,
+      targetTokens
+    )
+
+    // Step 2: Build the full tool pair map
+    const toolPairs = this.buildToolPairMap(messages)
+
+    // Step 3: Iteratively adjust truncation point
+    const maxIterations = messages.length // Prevent infinite loop
+    let iterations = 0
+
+    while (iterations < maxIterations) {
+      iterations++
+
+      // Get retained messages
+      const retainedMessages = messages.slice(truncationIndex)
+      if (retainedMessages.length === 0) break
+
+      // Collect all tool_use IDs in retained messages
+      const retainedToolUseIds = new Set<string>()
+      for (const msg of retainedMessages) {
+        for (const id of this.extractToolUseIds(msg)) {
+          retainedToolUseIds.add(id)
+        }
+      }
+
+      // Find orphaned tool_results in retained messages
+      const orphans = this.findOrphanedToolResults(
+        retainedMessages,
+        retainedToolUseIds
+      )
+
+      if (orphans.length === 0) {
+        // No orphans, we're done
+        break
+      }
+
+      // Find the earliest tool_use that needs to be included
+      let earliestToolUseIndex = truncationIndex
+
+      for (const orphan of orphans) {
+        const pair = toolPairs.get(orphan.tool_use_id)
+        if (pair && pair.tool_use_message_index < earliestToolUseIndex) {
+          earliestToolUseIndex = pair.tool_use_message_index
+        }
+      }
+
+      if (earliestToolUseIndex >= truncationIndex) {
+        // Can't move back further, or tool_use not found
+        // This means we have truly orphaned tool_results (no tool_use in history)
+        this.logger.warn(
+          `Found ${orphans.length} truly orphaned tool_result(s), cannot include tool_use`
+        )
+        break
+      }
+
+      // Move truncation point back to include the tool_use
+      this.logger.debug(
+        `Moving truncation point from ${truncationIndex} to ${earliestToolUseIndex} to include tool_use`
+      )
+      truncationIndex = earliestToolUseIndex
+    }
+
+    // Step 4: Also check for orphaned tool_uses at the end
+    // If the last assistant message has tool_use without result, we may need to remove it
+    const retainedMessages = messages.slice(truncationIndex)
+    const retainedToolResultIds = new Set<string>()
+    for (const msg of retainedMessages) {
+      for (const id of this.extractToolResultIds(msg)) {
+        retainedToolResultIds.add(id)
+      }
+    }
+
+    // Check for orphaned tool_uses at the end of retained messages
+    // These are acceptable - they represent pending tool calls
+    // But we should log them for debugging
+    const orphanedToolUses = this.findOrphanedToolUses(
+      retainedMessages,
+      retainedToolResultIds
+    )
+
+    if (orphanedToolUses.length > 0) {
+      this.logger.debug(
+        `Found ${orphanedToolUses.length} tool_use(s) without result (may be pending)`
+      )
+    }
+
+    return truncationIndex
+  }
+
+  /**
+   * Validate that messages have proper tool integrity
+   * Returns list of issues found
+   */
+  validateIntegrity(messages: UnifiedMessage[]): string[] {
+    const issues: string[] = []
+    const toolPairs = this.buildToolPairMap(messages)
+
+    // Collect all tool IDs
+    const allToolUseIds = new Set<string>()
+    const allToolResultIds = new Set<string>()
+
+    for (const msg of messages) {
+      for (const id of this.extractToolUseIds(msg)) {
+        allToolUseIds.add(id)
+      }
+      for (const id of this.extractToolResultIds(msg)) {
+        allToolResultIds.add(id)
+      }
+    }
+
+    // Check for orphaned tool_results
+    for (const id of allToolResultIds) {
+      if (!allToolUseIds.has(id)) {
+        issues.push(`Orphaned tool_result: ${id} (no matching tool_use)`)
+      }
+    }
+
+    // Check for tool_uses without results (warning, not error)
+    for (const id of allToolUseIds) {
+      if (!allToolResultIds.has(id)) {
+        const pair = toolPairs.get(id)
+        if (pair) {
+          issues.push(
+            `Tool_use without result: ${id} (${pair.tool_name}) - may be pending`
+          )
+        }
+      }
+    }
+
+    // Check message order: tool_use should come before its tool_result
+    for (const [id, pair] of toolPairs) {
+      if (
+        pair.tool_result_message_index !== null &&
+        pair.tool_result_message_index <= pair.tool_use_message_index
+      ) {
+        issues.push(
+          `Tool order violation: result for ${id} appears before or at same index as use`
+        )
+      }
+    }
+
+    return issues
+  }
+
+  /**
+   * Extract messages with tool integrity preserved
+   * This is a convenience method that combines findTruncationPointWithIntegrity
+   * with message slicing
+   */
+  extractWithIntegrity(
+    messages: UnifiedMessage[],
+    targetTokens: number
+  ): UnifiedMessage[] {
+    const truncationIndex = this.findTruncationPointWithIntegrity(
+      messages,
+      targetTokens
+    )
+    return messages.slice(truncationIndex)
+  }
+}

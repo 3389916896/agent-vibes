@@ -1,0 +1,841 @@
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from "@nestjs/common"
+import { ConfigService } from "@nestjs/config"
+import { ChildProcess, spawn } from "child_process"
+import * as fs from "fs"
+import * as path from "path"
+import * as readline from "readline"
+
+/**
+ * Account configuration for a native worker process
+ */
+export interface NativeAccount {
+  email: string
+  accessToken: string
+  refreshToken: string
+  expiresAt?: string
+  projectId?: string
+  isGcpTos?: boolean
+  cloudCodeUrlOverride?: string
+}
+
+/**
+ * IPC request message
+ */
+interface WorkerRequest {
+  id: string
+  method: string
+  params?: Record<string, unknown>
+}
+
+/**
+ * Pending request with promise resolve/reject
+ */
+interface PendingRequest {
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+  streamCallback?: (chunk: unknown) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
+/**
+ * A managed worker process
+ */
+interface WorkerHandle {
+  process: ChildProcess
+  account: NativeAccount
+  ready: boolean
+  pending: Map<string, PendingRequest>
+  requestCount: number
+  cooldownUntil: number // Date.now() timestamp; 0 = available
+  bootstrapComplete: boolean
+  readyResolve?: () => void // event-driven ready notification
+}
+
+// ---------------------------------------------------------------------------
+// Antigravity binary paths
+// ---------------------------------------------------------------------------
+const ANTIGRAVITY_NODE_BINARY = path.join(
+  "/Applications/Antigravity.app",
+  "Contents/Frameworks",
+  "Antigravity Helper (Plugin).app",
+  "Contents/MacOS",
+  "Antigravity Helper (Plugin)"
+)
+
+const WORKER_SCRIPT = path.resolve(__dirname, "worker.js")
+
+// Antigravity's node_modules for MODULE_PATH resolution
+const ANTIGRAVITY_NODE_MODULES = path.join(
+  "/Applications/Antigravity.app",
+  "Contents/Resources/app",
+  "node_modules"
+)
+
+/**
+ * ProcessPoolService — Manages a pool of Antigravity native worker processes
+ *
+ * Each worker process:
+ * - Runs using the Antigravity IDE's Node.js binary
+ * - Loads google-auth-library from the IDE's node_modules
+ * - Makes Cloud Code API calls with 100% native fingerprint
+ * - Communicates via JSON Lines over stdin/stdout
+ */
+@Injectable()
+export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(ProcessPoolService.name)
+  private readonly workers: WorkerHandle[] = []
+  private currentWorkerIndex = -1
+  private requestCounter = 0
+
+  constructor(private readonly configService: ConfigService) {}
+
+  async onModuleInit(): Promise<void> {
+    this.logger.log("Initializing native process pool...")
+
+    // Verify Antigravity binary exists
+    if (!fs.existsSync(ANTIGRAVITY_NODE_BINARY)) {
+      this.logger.error(
+        `Antigravity binary not found: ${ANTIGRAVITY_NODE_BINARY}`
+      )
+      return
+    }
+
+    // Verify worker script exists
+    if (!fs.existsSync(WORKER_SCRIPT)) {
+      this.logger.error(`Worker script not found: ${WORKER_SCRIPT}`)
+      return
+    }
+
+    // Load accounts and spawn workers
+    const accounts = this.loadAccounts()
+    if (accounts.length === 0) {
+      this.logger.warn("No accounts configured — pool is empty")
+      return
+    }
+
+    for (const account of accounts) {
+      await this.spawnWorker(account)
+    }
+
+    this.logger.log(
+      `Process pool initialized: ${this.workers.length} worker(s)`
+    )
+
+    // Pre-flight quota check: test each worker and cooldown exhausted ones
+    await this.preflightQuotaCheck()
+  }
+
+  /**
+   * Pre-flight quota check: probe each worker with a minimal request.
+   * Workers that return 429 get a long cooldown so they are not
+   * selected during rotation.
+   */
+  private async preflightQuotaCheck(): Promise<void> {
+    const PREFLIGHT_COOLDOWN_MS = 5 * 60_000 // 5 minutes
+
+    const checks = this.workers
+      .filter((w) => w.ready)
+      .map(async (worker) => {
+        try {
+          await this.primeWorkerBootstrap(worker)
+          await this.sendRequest(worker, "checkAvailability", undefined, 15000)
+          this.logger.log(
+            `[Worker ${worker.account.email}] quota check: ✓ available`
+          )
+        } catch (err) {
+          const msg = (err as Error).message || ""
+          if (msg.includes("429")) {
+            worker.cooldownUntil = Date.now() + PREFLIGHT_COOLDOWN_MS
+            this.logger.warn(
+              `[Worker ${worker.account.email}] quota check: ✗ rate-limited, cooldown ${PREFLIGHT_COOLDOWN_MS / 1000}s`
+            )
+          } else {
+            this.logger.warn(
+              `[Worker ${worker.account.email}] quota check: ✗ ${msg.slice(0, 120)}`
+            )
+          }
+        }
+      })
+
+    await Promise.all(checks)
+
+    const available = this.workers.filter(
+      (w) => w.ready && w.cooldownUntil <= Date.now()
+    ).length
+    this.logger.log(
+      `Pre-flight quota check: ${available}/${this.workers.length} worker(s) available`
+    )
+  }
+
+  onModuleDestroy(): void {
+    this.logger.log("Shutting down process pool...")
+    for (const worker of this.workers) {
+      this.killWorker(worker)
+    }
+    this.workers.length = 0
+  }
+
+  /**
+   * Load accounts from config file.
+   * Canonical location: apps/protocol-bridge/data/accounts.json
+   * (generated by: npm run antigravity:sync -- --ide)
+   */
+  private loadAccounts(): NativeAccount[] {
+    const configPaths = [
+      path.resolve("data/accounts.json"),
+      path.resolve("apps/protocol-bridge/data/accounts.json"),
+    ]
+
+    for (const configPath of configPaths) {
+      if (fs.existsSync(configPath)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
+            accounts?: NativeAccount[]
+          }
+          if (Array.isArray(data.accounts) && data.accounts.length > 0) {
+            this.logger.log(
+              `Loaded ${data.accounts.length} account(s) from ${configPath}`
+            )
+            return data.accounts
+          }
+        } catch (err) {
+          this.logger.warn(
+            `Failed to parse ${configPath}: ${(err as Error).message}`
+          )
+        }
+      }
+    }
+
+    this.logger.warn(
+      "No accounts.json found — run: npm run antigravity:sync -- --ide"
+    )
+    return []
+  }
+
+  /**
+   * Spawn a native worker process for the given account
+   */
+  private async spawnWorker(account: NativeAccount): Promise<void> {
+    const child = spawn(ANTIGRAVITY_NODE_BINARY, [WORKER_SCRIPT], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        NODE_PATH: ANTIGRAVITY_NODE_MODULES,
+        NODE_OPTIONS: "",
+      },
+    })
+
+    const handle: WorkerHandle = {
+      process: child,
+      account,
+      ready: false,
+      pending: new Map(),
+      requestCount: 0,
+      cooldownUntil: 0,
+      bootstrapComplete: false,
+    }
+
+    // Parse stdout as JSON Lines
+    const rl = readline.createInterface({
+      input: child.stdout ?? process.stdin,
+      terminal: false,
+    })
+
+    rl.on("line", (line: string) => {
+      this.handleWorkerMessage(handle, line)
+    })
+
+    // Log stderr
+    child.stderr?.on("data", (data: Buffer) => {
+      this.logger.debug(
+        `[Worker ${account.email}] stderr: ${data.toString().trim()}`
+      )
+    })
+
+    child.on("exit", (code: number | null) => {
+      this.logger.warn(`[Worker ${account.email}] exited with code ${code}`)
+      handle.ready = false
+      // Reject all pending requests
+      for (const [, pending] of handle.pending) {
+        clearTimeout(pending.timeout)
+        pending.reject(new Error(`Worker process exited (code ${code})`))
+      }
+      handle.pending.clear()
+      // Auto-restart after delay
+      setTimeout(() => {
+        this.restartWorker(handle).catch((err) => {
+          this.logger.error(
+            `Failed to restart worker: ${(err as Error).message}`
+          )
+        })
+      }, 3000)
+    })
+
+    this.workers.push(handle)
+
+    // Wait for ready signal
+    await this.waitForReady(handle, 10000)
+
+    // Initialize with account credentials
+    await this.sendRequest(handle, "init", {
+      account: {
+        email: account.email,
+        accessToken: account.accessToken,
+        refreshToken: account.refreshToken,
+        expiresAt: account.expiresAt,
+        projectId: account.projectId,
+        isGcpTos: account.isGcpTos ?? false,
+        cloudCodeUrlOverride: account.cloudCodeUrlOverride,
+      },
+    })
+
+    handle.ready = true
+    this.logger.log(`[Worker ${account.email}] initialized and ready`)
+  }
+
+  /**
+   * Wait for worker ready signal
+   */
+  private waitForReady(handle: WorkerHandle, timeoutMs: number): Promise<void> {
+    if (handle.ready) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        handle.readyResolve = undefined
+        reject(new Error("Worker ready timeout"))
+      }, timeoutMs)
+
+      handle.readyResolve = () => {
+        clearTimeout(timer)
+        handle.readyResolve = undefined
+        resolve()
+      }
+    })
+  }
+
+  /**
+   * Restart a crashed worker
+   */
+  private async restartWorker(oldHandle: WorkerHandle): Promise<void> {
+    const index = this.workers.indexOf(oldHandle)
+    if (index === -1) return
+
+    this.logger.log(`Restarting worker for ${oldHandle.account.email}...`)
+    this.workers.splice(index, 1)
+    await this.spawnWorker(oldHandle.account)
+  }
+
+  /**
+   * Kill a worker process
+   */
+  private killWorker(handle: WorkerHandle): void {
+    try {
+      handle.process.kill("SIGTERM")
+    } catch {
+      // Process may already be dead
+    }
+    for (const [, pending] of handle.pending) {
+      clearTimeout(pending.timeout)
+      pending.reject(new Error("Worker killed"))
+    }
+    handle.pending.clear()
+  }
+
+  /**
+   * Handle a message from a worker process
+   */
+  private handleWorkerMessage(handle: WorkerHandle, line: string): void {
+    try {
+      const msg = JSON.parse(line) as {
+        type?: string
+        id?: string
+        result?: unknown
+        error?: { message: string; stack?: string }
+        stream?: unknown
+        tokens?: {
+          accessToken: string
+          refreshToken: string
+          expiresAt?: string
+        }
+      }
+
+      // Ready signal
+      if (msg.type === "ready") {
+        handle.ready = true
+        if (handle.readyResolve) handle.readyResolve()
+        this.logger.debug(
+          `[Worker ${handle.account.email}] ready (pid: ${handle.process.pid})`
+        )
+        return
+      }
+
+      // Token refresh notification
+      if (msg.type === "token_refresh" && msg.tokens) {
+        handle.account.accessToken = msg.tokens.accessToken
+        handle.account.refreshToken = msg.tokens.refreshToken
+        if (msg.tokens.expiresAt) {
+          handle.account.expiresAt = msg.tokens.expiresAt
+        }
+        this.logger.debug(`[Worker ${handle.account.email}] token refreshed`)
+        return
+      }
+
+      // Response to a pending request
+      const id = msg.id
+      if (!id) return
+
+      const pending = handle.pending.get(id)
+      if (!pending) return
+
+      // Streaming chunk
+      if ("stream" in msg) {
+        if (msg.stream === null) {
+          // Stream end
+          clearTimeout(pending.timeout)
+          handle.pending.delete(id)
+          pending.resolve(undefined)
+        } else if (pending.streamCallback) {
+          pending.streamCallback(msg.stream)
+        }
+        return
+      }
+
+      // Regular response
+      clearTimeout(pending.timeout)
+      handle.pending.delete(id)
+
+      if (msg.error) {
+        pending.reject(new Error(msg.error.message))
+      } else {
+        pending.resolve(msg.result)
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Failed to parse worker message: ${(err as Error).message}`
+      )
+    }
+  }
+
+  private extractCloudCodeProjectId(result: unknown): string | null {
+    if (!result || typeof result !== "object") return null
+    const candidate = (result as { cloudaicompanionProject?: unknown })
+      .cloudaicompanionProject
+    if (typeof candidate === "string" && candidate.trim() !== "") {
+      return candidate.trim()
+    }
+    return null
+  }
+
+  private async ensureWorkerProjectId(handle: WorkerHandle): Promise<void> {
+    const currentProjectId =
+      typeof handle.account.projectId === "string"
+        ? handle.account.projectId.trim()
+        : ""
+    if (currentProjectId) return
+
+    const result = await this.sendRequest(
+      handle,
+      "loadCodeAssist",
+      {
+        metadata: {
+          ideType: "ANTIGRAVITY",
+        },
+      },
+      15000
+    )
+    const resolvedProjectId = this.extractCloudCodeProjectId(result)
+    if (resolvedProjectId) {
+      handle.account.projectId = resolvedProjectId
+      this.logger.log(
+        `[Worker ${handle.account.email}] resolved Cloud Code project: ${resolvedProjectId}`
+      )
+      return
+    }
+
+    this.logger.warn(
+      `[Worker ${handle.account.email}] loadCodeAssist returned no Cloud Code project`
+    )
+  }
+
+  private async primeWorkerBootstrap(handle: WorkerHandle): Promise<void> {
+    if (handle.bootstrapComplete) return
+
+    try {
+      await this.sendRequest(handle, "fetchUserInfo", undefined, 10000)
+    } catch (error) {
+      this.logger.debug(
+        `[Worker ${handle.account.email}] fetchUserInfo bootstrap skipped: ${(error as Error).message}`
+      )
+    }
+
+    await this.ensureWorkerProjectId(handle)
+    handle.bootstrapComplete = true
+  }
+
+  private async preparePayloadForWorker(
+    handle: WorkerHandle,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    await this.primeWorkerBootstrap(handle)
+    const projectId =
+      typeof handle.account.projectId === "string"
+        ? handle.account.projectId.trim()
+        : ""
+    if (projectId) {
+      payload.project = projectId
+    }
+  }
+
+  /**
+   * Send request to a specific worker and wait for response
+   */
+  private sendRequest(
+    handle: WorkerHandle,
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs: number = 60000
+  ): Promise<unknown> {
+    const id = `req-${++this.requestCounter}`
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        handle.pending.delete(id)
+        reject(new Error(`Worker request timeout: ${method}`))
+      }, timeoutMs)
+
+      handle.pending.set(id, { resolve, reject, timeout })
+
+      const request: WorkerRequest = { id, method, params }
+      handle.process.stdin!.write(JSON.stringify(request) + "\n")
+    })
+  }
+
+  /**
+   * Send streaming request to a specific worker
+   */
+  private async sendStreamRequest(
+    handle: WorkerHandle,
+    method: string,
+    params: Record<string, unknown>,
+    onChunk: (chunk: unknown) => void,
+    timeoutMs: number = 300000
+  ): Promise<void> {
+    const id = `req-${++this.requestCounter}`
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        handle.pending.delete(id)
+        reject(new Error(`Worker stream timeout: ${method}`))
+      }, timeoutMs)
+
+      handle.pending.set(id, {
+        resolve: () => resolve(),
+        reject,
+        streamCallback: onChunk,
+        timeout,
+      })
+
+      const request: WorkerRequest = { id, method, params }
+      handle.process.stdin!.write(JSON.stringify(request) + "\n")
+    })
+  }
+
+  // =========================================================================
+  // Public API
+  // =========================================================================
+
+  private normalizeWorkerIndex(workerCount: number): number {
+    if (workerCount <= 0) return 0
+    const normalized = this.currentWorkerIndex % workerCount
+    return normalized < 0 ? normalized + workerCount : normalized
+  }
+
+  /**
+   * Get the next available worker (round-robin, cooldown-aware)
+   *
+   * Prefers workers that are ready AND not in cooldown.
+   * If every ready worker is cooling down, returns the one whose
+   * cooldown expires soonest so the caller can sleep on it.
+   */
+  private getNextWorker(): WorkerHandle {
+    const now = Date.now()
+    const readyWorkers = this.workers.filter((w) => w.ready)
+    if (readyWorkers.length === 0) {
+      throw new Error("No ready workers in the process pool")
+    }
+
+    const startIndex = this.normalizeWorkerIndex(readyWorkers.length)
+    let fallbackIndex = startIndex
+    let fallbackCooldown = Number.POSITIVE_INFINITY
+
+    for (let offset = 1; offset <= readyWorkers.length; offset++) {
+      const index = (startIndex + offset) % readyWorkers.length
+      const worker = readyWorkers[index]
+      if (!worker) continue
+      if (worker.cooldownUntil <= now) {
+        this.currentWorkerIndex = index
+        return worker
+      }
+      if (worker.cooldownUntil < fallbackCooldown) {
+        fallbackCooldown = worker.cooldownUntil
+        fallbackIndex = index
+      }
+    }
+
+    this.currentWorkerIndex = fallbackIndex
+    return readyWorkers[fallbackIndex]!
+  }
+
+  private findReadyWorkerByProjectId(projectId: string): WorkerHandle | null {
+    const normalizedProjectId = projectId.trim()
+    if (!normalizedProjectId) return null
+
+    const now = Date.now()
+    const readyWorkers = this.workers.filter((worker) => {
+      if (!worker.ready) return false
+      const workerProjectId =
+        typeof worker.account.projectId === "string"
+          ? worker.account.projectId.trim()
+          : ""
+      return workerProjectId === normalizedProjectId
+    })
+    if (readyWorkers.length === 0) return null
+
+    const available = readyWorkers.filter((worker) => worker.cooldownUntil <= now)
+    return available[0] ?? readyWorkers[0] ?? null
+  }
+
+  /**
+   * Switch to next worker (on error/quota exhaustion)
+   */
+  switchToNextWorker(): void {
+    this.currentWorkerIndex++
+    this.logger.log(
+      `Switched to worker index ${this.currentWorkerIndex % Math.max(this.workers.length, 1)}`
+    )
+  }
+
+  /**
+   * Mark the current worker as rate-limited for `delayMs` milliseconds.
+   */
+  setCooldown(delayMs: number): void {
+    const now = Date.now()
+    const readyWorkers = this.workers.filter((w) => w.ready)
+    if (readyWorkers.length === 0) return
+    const idx = this.normalizeWorkerIndex(readyWorkers.length)
+    const worker = readyWorkers[idx]
+    if (!worker) return
+    worker.cooldownUntil = now + delayMs
+    const readableDuration =
+      delayMs >= 3600_000
+        ? `${Math.floor(delayMs / 3600_000)}h ${Math.floor((delayMs % 3600_000) / 60_000)}m`
+        : delayMs >= 60_000
+          ? `${Math.floor(delayMs / 60_000)}m ${Math.floor((delayMs % 60_000) / 1000)}s`
+          : `${delayMs}ms`
+    this.logger.warn(
+      `[Worker ${worker.account.email}] rate-limited, cooldown ${readableDuration}`
+    )
+  }
+
+  /**
+   * Returns true if at least one ready worker is NOT in cooldown.
+   */
+  hasAvailableWorker(): boolean {
+    const now = Date.now()
+    return this.workers.some((w) => w.ready && w.cooldownUntil <= now)
+  }
+
+  /**
+   * Returns the shortest remaining cooldown (ms) across all ready workers.
+   * Returns 0 if a worker is already available.
+   */
+  getMinCooldownMs(): number {
+    const now = Date.now()
+    let min = Infinity
+    for (const w of this.workers) {
+      if (!w.ready) continue
+      const remaining = Math.max(0, w.cooldownUntil - now)
+      if (remaining < min) min = remaining
+    }
+    return min === Infinity ? 0 : min
+  }
+
+  /**
+   * Check if any worker is available
+   */
+  isConfigured(): boolean {
+    return this.workers.some((w) => w.ready)
+  }
+
+  /**
+   * Check Cloud Code availability
+   */
+  async checkAvailability(): Promise<boolean> {
+    try {
+      const worker = this.getNextWorker()
+      await this.primeWorkerBootstrap(worker)
+      const result = (await this.sendRequest(
+        worker,
+        "checkAvailability",
+        undefined,
+        15000
+      )) as { available: boolean }
+      return result.available
+    } catch (err) {
+      this.logger.error(`Availability check failed: ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  /**
+   * Send non-streaming generate request
+   */
+  async generate(payload: Record<string, unknown>): Promise<unknown> {
+    const worker = this.getNextWorker()
+    worker.requestCount++
+    await this.preparePayloadForWorker(worker, payload)
+    return this.sendRequest(worker, "generate", { payload })
+  }
+
+  /**
+   * Send streaming generate request
+   */
+  async generateStream(
+    payload: Record<string, unknown>,
+    onChunk: (chunk: unknown) => void
+  ): Promise<void> {
+    const worker = this.getNextWorker()
+    worker.requestCount++
+    await this.preparePayloadForWorker(worker, payload)
+    await this.sendStreamRequest(worker, "generateStream", { payload }, onChunk)
+  }
+
+  /**
+   * Get available models from Cloud Code
+   */
+  async fetchAvailableModels(): Promise<unknown> {
+    const worker = this.getNextWorker()
+    await this.primeWorkerBootstrap(worker)
+    return this.sendRequest(worker, "fetchAvailableModels")
+  }
+
+  async fetchUserInfo(projectId?: string): Promise<unknown> {
+    const worker = this.getNextWorker()
+    return this.sendRequest(worker, "fetchUserInfo", { projectId })
+  }
+
+  async loadCodeAssist(
+    metadata?: Record<string, unknown>,
+    projectId?: string
+  ): Promise<unknown> {
+    const worker = this.getNextWorker()
+    const result = await this.sendRequest(worker, "loadCodeAssist", {
+      metadata,
+      projectId,
+    })
+    const resolvedProjectId = this.extractCloudCodeProjectId(result)
+    if (resolvedProjectId) {
+      worker.account.projectId = resolvedProjectId
+    }
+    return result
+  }
+
+  /**
+   * Execute web search via Cloud Code API (through worker with auth)
+   */
+  async webSearch(query: string): Promise<unknown> {
+    const worker = this.getNextWorker()
+    await this.primeWorkerBootstrap(worker)
+    return this.sendRequest(worker, "webSearch", { query })
+  }
+
+  async recordCodeAssistMetrics(
+    payload: Record<string, unknown>
+  ): Promise<unknown> {
+    const requestedProjectId =
+      typeof payload.project === "string" ? payload.project.trim() : ""
+    const worker =
+      this.findReadyWorkerByProjectId(requestedProjectId) ??
+      this.getNextWorker()
+    await this.primeWorkerBootstrap(worker)
+    if (
+      typeof payload.project !== "string" ||
+      payload.project.trim().length === 0
+    ) {
+      const projectId =
+        typeof worker.account.projectId === "string"
+          ? worker.account.projectId.trim()
+          : ""
+      if (projectId) {
+        payload.project = projectId
+      }
+    }
+    return this.sendRequest(worker, "recordCodeAssistMetrics", { payload })
+  }
+
+  async recordTrajectoryAnalytics(
+    payload: Record<string, unknown>,
+    projectId?: string
+  ): Promise<unknown> {
+    const normalizedProjectId =
+      typeof projectId === "string" ? projectId.trim() : ""
+    const worker =
+      this.findReadyWorkerByProjectId(normalizedProjectId) ??
+      this.getNextWorker()
+    return this.sendRequest(worker, "recordTrajectoryAnalytics", { payload })
+  }
+
+  /**
+   * Get current worker account email
+   */
+  getCurrentEmail(): string | null {
+    const readyWorkers = this.workers.filter((w) => w.ready)
+    if (readyWorkers.length === 0) return null
+    const idx = this.normalizeWorkerIndex(readyWorkers.length)
+    const worker = readyWorkers[idx]
+    return worker?.account.email ?? null
+  }
+
+  /**
+   * Get total number of workers in the pool
+   */
+  get workerCount(): number {
+    return this.workers.length
+  }
+
+  /**
+   * Get pool status
+   */
+  getStatus(): {
+    total: number
+    ready: number
+    available: number
+    workers: Array<{
+      email: string
+      ready: boolean
+      cooldownUntil: number
+      requestCount: number
+      pid: number | undefined
+    }>
+  } {
+    const now = Date.now()
+    return {
+      total: this.workers.length,
+      ready: this.workers.filter((w) => w.ready).length,
+      available: this.workers.filter((w) => w.ready && w.cooldownUntil <= now)
+        .length,
+      workers: this.workers.map((w) => ({
+        email: w.account.email,
+        ready: w.ready,
+        cooldownUntil: w.cooldownUntil,
+        requestCount: w.requestCount,
+        pid: w.process.pid,
+      })),
+    }
+  }
+}

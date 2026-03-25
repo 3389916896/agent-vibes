@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: cd apps/protocol-bridge && npm run build
+
+      - name: Create release tarball
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          tar -czf agent-vibes-${VERSION}.tar.gz \
+            --exclude='node_modules' \
+            --exclude='.git' \
+            --exclude='.history' \
+            --exclude='scripts/capture/traffic_dumps' \
+            --exclude='apps/protocol-bridge/certs' \
+            --exclude='apps/protocol-bridge/.env.local' \
+            --exclude='apps/protocol-bridge/data/accounts.json' \
+            .
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: agent-vibes-${{ env.VERSION }}.tar.gz
+          generate_release_notes: true

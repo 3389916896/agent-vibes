@@ -1,0 +1,17 @@
+{
+  "name": "@workspace/typescript-config",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "types": "echo 'No TypeScript files to check'",
+    "clean": "rm -rf .turbo node_modules"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  }
+}

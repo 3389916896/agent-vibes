@@ -1,0 +1,18 @@
+{
+  "name": "@workspace/prettier-config",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./index.js",
+  "scripts": {
+    "types": "echo 'No TypeScript files to check'",
+    "clean": "rm -rf .turbo node_modules"
+  },
+  "devDependencies": {
+    "prettier": "^3.7.4",
+    "prettier-plugin-tailwindcss": "^0.7.2"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "deleteOutDir": true,
+    "webpack": false,
+    "tsConfigPath": "tsconfig.build.json",
+    "assets": [
+      {
+        "include": "llm/native/worker.js",
+        "watchAssets": true
+      },
+      {
+        "include": "../data/**/*",
+        "outDir": "dist/data",
+        "watchAssets": false
+      }
+    ]
+  }
+}

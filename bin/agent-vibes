@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+/**
+ * agent-vibes CLI — Unified Agent Gateway
+ *
+ * Usage:
+ *   agent-vibes                     Start the gateway server
+ *   agent-vibes sync --ide|--tools  Sync Antigravity credentials
+ *   agent-vibes sync --codex        Sync Codex credentials
+ *   agent-vibes cert                Generate SSL certificates (requires mkcert)
+ *   agent-vibes patch               Patch Cursor binary
+ *   agent-vibes patch --restore     Restore Cursor binary
+ *   agent-vibes forward on|off|status  Manage port forwarding
+ *   agent-vibes --version           Show version
+ *   agent-vibes --help              Show help
+ */
+
+const path = require("path")
+const fs = require("fs")
+const { execSync, spawnSync } = require("child_process")
+
+const ROOT = path.resolve(__dirname, "..")
+const args = process.argv.slice(2)
+const command = args[0]
+
+// --version
+if (args.includes("--version") || args.includes("-v")) {
+  const pkg = JSON.parse(
+    fs.readFileSync(
+      path.join(ROOT, "apps", "protocol-bridge", "package.json"),
+      "utf-8"
+    )
+  )
+  console.log(`agent-vibes v${pkg.version}`)
+  process.exit(0)
+}
+
+// --help
+if (args.includes("--help") || args.includes("-h") || command === "help") {
+  console.log(`
+agent-vibes — Unified Agent Gateway
+
+Enables Claude Code CLI and Cursor IDE to use Antigravity AI backends
+through protocol translation.
+
+Usage:
+  agent-vibes                         Start the gateway server
+  agent-vibes sync --ide              Sync credentials from Antigravity IDE
+  agent-vibes sync --tools            Sync credentials from Antigravity Manager
+  agent-vibes sync --codex            Sync credentials from Codex CLI auth.json
+  agent-vibes cert                    Generate SSL certificates (requires mkcert)
+  agent-vibes patch                   Patch Cursor binary for proxy
+  agent-vibes patch --restore         Restore original Cursor binary
+  agent-vibes patch --status          Check Cursor patch status
+  agent-vibes forward on              Enable port forwarding (requires sudo)
+  agent-vibes forward off             Disable port forwarding (requires sudo)
+  agent-vibes forward status          Show forwarding status
+  agent-vibes forward hosts           Print /etc/hosts entries
+  agent-vibes issues                  Collect diagnostics for bug reports
+  agent-vibes --version               Show version
+  agent-vibes --help                  Show help
+
+Environment Variables:
+  PORT                  Server port (default: 8000)
+  PROXY_API_KEY         API key for authentication
+  ANTIGRAVITY_STORAGE   Path to Antigravity credentials
+
+Documentation: https://github.com/funny-vibes/agent-vibes
+`)
+  process.exit(0)
+}
+
+// Sub-commands
+function run(cmd, opts = {}) {
+  const result = spawnSync("bash", ["-c", cmd], {
+    cwd: ROOT,
+    stdio: "inherit",
+    ...opts,
+  })
+  process.exit(result.status || 0)
+}
+
+if (command === "sync") {
+  const syncArgs = args.slice(1).join(" ")
+  if (args.includes("--codex")) {
+    run(`node scripts/accounts/sync-codex-account.js`)
+  } else {
+    run(`node scripts/accounts/sync-antigravity-accounts.js ${syncArgs}`)
+  }
+}
+
+if (command === "cert") {
+  const certDir = path.join(ROOT, "apps", "protocol-bridge", "certs")
+  if (!fs.existsSync(certDir)) {
+    fs.mkdirSync(certDir, { recursive: true })
+  }
+  run(
+    `cd apps/protocol-bridge/certs && mkcert -cert-file localhost.crt -key-file localhost.key localhost '*.api5.cursor.sh' '*.cursor.sh' api2.cursor.sh api2geo.cursor.sh api2direct.cursor.sh agent.api2.cursor.sh agentn.api2.cursor.sh agent.api2geo.cursor.sh agentn.api2geo.cursor.sh agent.api2direct.cursor.sh agentn.api2direct.cursor.sh agent.api5.cursor.sh agentn.api5.cursor.sh agent.api5geo.cursor.sh agent.api5lat.cursor.sh agentn.api5geo.cursor.sh agentn.api5lat.cursor.sh agent-gcpp-uswest.api5.cursor.sh agent-gcpp-eucentral.api5.cursor.sh agent-gcpp-apsoutheast.api5.cursor.sh agentn-gcpp-uswest.api5.cursor.sh agentn-gcpp-eucentral.api5.cursor.sh agentn-gcpp-apsoutheast.api5.cursor.sh agent.us.api5.cursor.sh agent.eu.api5.cursor.sh agent.ap.api5.cursor.sh agentn.us.api5.cursor.sh agentn.eu.api5.cursor.sh agentn.ap.api5.cursor.sh a.cursor.sh 127.0.0.1 127.0.0.2 127.0.0.3 ::1`
+  )
+}
+
+if (command === "patch") {
+  const patchArgs = args.slice(1).join(" ")
+  run(
+    `NO_PROXY='127.0.0.1,localhost,127.0.0.2,*.cursor.sh,*.azureedge.net' npx ts-node scripts/cursor/patch_transport.ts ${patchArgs}`
+  )
+}
+
+if (command === "forward") {
+  const subCmd = args[1] || "status"
+  if (subCmd === "on" || subCmd === "off") {
+    if (process.platform === "win32") {
+      // Windows: node script checks for admin internally
+      run(`node scripts/proxy/setup-forwarding.js ${subCmd}`)
+    } else {
+      run(`sudo node scripts/proxy/setup-forwarding.js ${subCmd}`)
+    }
+  } else {
+    run(`node scripts/proxy/setup-forwarding.js ${subCmd}`)
+  }
+}
+
+if (command === "issues") {
+  const issueArgs = args.slice(1).join(" ")
+  run(`node scripts/diagnostics/collect-issue-logs.js ${issueArgs}`)
+}
+
+// Default: start server
+const mainPath = path.join(ROOT, "apps", "protocol-bridge", "dist", "main.js")
+
+if (!fs.existsSync(mainPath)) {
+  console.error(
+    "Error: Server not built. Run 'npm run build' in apps/protocol-bridge first."
+  )
+  process.exit(1)
+}
+
+require(mainPath)

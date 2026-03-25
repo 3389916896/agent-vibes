@@ -1,0 +1,82 @@
+{
+  "name": "agent-vibes",
+  "version": "1.0.0",
+  "description": "Unified Agent Gateway — Enables Claude Code CLI and Cursor IDE to use free AI backends through protocol translation",
+  "private": true,
+  "bin": {
+    "agent-vibes": "bin/agent-vibes"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/funny-vibes/agent-vibes.git"
+  },
+  "homepage": "https://github.com/funny-vibes/agent-vibes#readme",
+  "bugs": {
+    "url": "https://github.com/funny-vibes/agent-vibes/issues"
+  },
+  "author": "recronin",
+  "keywords": [
+    "agent-vibes",
+    "cursor",
+    "claude-code",
+    "antigravity",
+    "codex",
+    "ai-gateway",
+    "nestjs"
+  ],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "prepare": "husky",
+    "dev": "turbo run dev",
+    "release": "git pull && git push origin dev && git checkout master && git pull && git merge dev --no-edit && git push && git checkout dev && echo '' && echo 'Released! Check Actions for deployment status.'",
+    "build": "turbo run build",
+    "start": "turbo run start",
+    "test": "turbo run test",
+    "format": "prettier --check \"**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,json,md,yml,yaml}\"",
+    "format:fix": "prettier --write \"**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,json,md,yml,yaml}\"",
+    "lint": "turbo run lint",
+    "types": "turbo run types",
+    "lint:fix": "turbo run lint:fix",
+    "clean": "node scripts/clean-dist.js",
+    "clean:all": "npm run clean && rm -rf node_modules",
+    "cursor:patch": "NO_PROXY='127.0.0.1,localhost,127.0.0.2,*.cursor.sh,*.azureedge.net' npx ts-node scripts/cursor/patch_transport.ts",
+    "cursor:debug": "node -e \"const p=require('./scripts/lib/platform');const{execSync}=require('child_process');execSync('mkdir -p .log && ELECTRON_ENABLE_LOGGING=1 '+p.cursorBinaryPath()+' 2>&1 | tee .log/cursor_grpc.log',{stdio:'inherit'})\"",
+    "cursor:patch:restore": "npx ts-node scripts/cursor/patch_transport.ts --restore",
+    "cursor:patch:status": "npx ts-node scripts/cursor/patch_transport.ts --status",
+    "cursor:cert": "cd apps/protocol-bridge/certs && mkcert -cert-file localhost.crt -key-file localhost.key localhost '*.api5.cursor.sh' '*.cursor.sh' api2.cursor.sh api2geo.cursor.sh api2direct.cursor.sh agent.api2.cursor.sh agentn.api2.cursor.sh agent.api2geo.cursor.sh agentn.api2geo.cursor.sh agent.api2direct.cursor.sh agentn.api2direct.cursor.sh agent.api5.cursor.sh agentn.api5.cursor.sh agent.api5geo.cursor.sh agent.api5lat.cursor.sh agentn.api5geo.cursor.sh agentn.api5lat.cursor.sh agent-gcpp-uswest.api5.cursor.sh agent-gcpp-eucentral.api5.cursor.sh agent-gcpp-apsoutheast.api5.cursor.sh agentn-gcpp-uswest.api5.cursor.sh agentn-gcpp-eucentral.api5.cursor.sh agentn-gcpp-apsoutheast.api5.cursor.sh agent.us.api5.cursor.sh agent.eu.api5.cursor.sh agent.ap.api5.cursor.sh agentn.us.api5.cursor.sh agentn.eu.api5.cursor.sh agentn.ap.api5.cursor.sh a.cursor.sh 127.0.0.1 127.0.0.2 127.0.0.3 ::1",
+    "cursor:forward:on": "sudo node scripts/proxy/setup-forwarding.js on",
+    "cursor:forward:off": "sudo node scripts/proxy/setup-forwarding.js off",
+    "cursor:forward:status": "node scripts/proxy/setup-forwarding.js status",
+    "antigravity:sync": "node scripts/accounts/sync-antigravity-accounts.js",
+    "codex:sync": "node scripts/accounts/sync-codex-account.js",
+    "antigravity:capture:start": "sudo node scripts/capture/capture.js start",
+    "antigravity:capture:stop": "sudo node scripts/capture/capture.js stop",
+    "antigravity:capture:status": "sudo node scripts/capture/capture.js status",
+    "issues": "node scripts/diagnostics/collect-issue-logs.js"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.1.0",
+    "@commitlint/config-conventional": "^20.0.0",
+    "@eslint/js": "^9.39.1",
+    "eslint": "^9.39.1",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.5.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "markdownlint-cli2": "^0.20.0",
+    "prettier": "^3.7.4",
+    "turbo": "^2.6.3"
+  },
+  "prettier": "@workspace/prettier-config",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "packageManager": "npm@11.6.4",
+  "dependencies": {
+    "socks-proxy-agent": "^8.0.5"
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "stream",
+  "envMode": "strict",
+  "globalDependencies": [
+    ".env",
+    ".env.local",
+    "tsconfig.json",
+    "package-lock.json"
+  ],
+  "globalEnv": ["NODE_ENV"],
+  "globalPassThroughEnv": [
+    "CI",
+    "GITHUB_*",
+    "TURBO_TOKEN",
+    "TURBO_TEAM",
+    "TURBO_REMOTE_ONLY",
+    "PORT",
+    "PROXY_API_KEY",
+    "KIRO_CREDS_FILE",
+    "KIRO_REGION",
+    "ANTIGRAVITY_STORAGE"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "package.json",
+        "tsconfig*.json",
+        ".env*"
+      ],
+      "outputs": ["dist/**"],
+      "outputLogs": "new-only"
+    },
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "inputs": [
+        "**/*.ts",
+        "**/*.tsx",
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.mjs",
+        "eslint.config.mjs",
+        "eslint.config.js",
+        "package.json"
+      ],
+      "outputLogs": "new-only"
+    },
+    "lint:fix": {
+      "inputs": [
+        "**/*.ts",
+        "**/*.tsx",
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.mjs",
+        "eslint.config.mjs",
+        "eslint.config.js",
+        "package.json"
+      ],
+      "cache": false,
+      "outputLogs": "new-only"
+    },
+    "start": {
+      "dependsOn": ["build"],
+      "cache": false,
+      "persistent": true
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "**/*.test.ts",
+        "**/*.spec.ts",
+        "**/__tests__/**",
+        "jest.config.*"
+      ],
+      "outputs": ["coverage/**"],
+      "outputLogs": "new-only"
+    },
+    "types": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**/*.ts",
+        "tsconfig*.json",
+        "package.json"
+      ],
+      "outputLogs": "full"
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

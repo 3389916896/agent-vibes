@@ -1,0 +1,34 @@
+.history
+.DS_Store
+node_modules
+.next
+dist
+.playwright-mcp
+.turbo
+.cursor
+cursor.log
+.log/
+*.tsbuildinfo
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Generated/sensitive files
+apps/protocol-bridge/certs/
+apps/protocol-bridge/.env
+apps/protocol-bridge/.env.*
+!apps/protocol-bridge/.env.example
+apps/protocol-bridge/data/accounts.json
+apps/protocol-bridge/data/accounts.local.json
+backups/
+logs/codex-cases/
+scripts/capture/traffic_dumps/
+scripts/capture/.clash-script-backup.js
+scripts/capture/antigravity_traffic.log
+
+# Runtime data
+*.pem
+*.sqlite
+*.sqlite-journal

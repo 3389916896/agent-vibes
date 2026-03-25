@@ -1,0 +1,65 @@
+name: Deploy Claude Proxy
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "apps/protocol-bridge/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        working-directory: apps/protocol-bridge
+        run: npm install --ignore-scripts
+
+      - name: Build
+        working-directory: apps/protocol-bridge
+        run: npm run build
+
+      - name: Deploy to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "apps/protocol-bridge/dist/,apps/protocol-bridge/package.json,apps/protocol-bridge/.env.production.example,apps/protocol-bridge/data/"
+          target: "/opt/protocol-bridge"
+          strip_components: 2
+
+      - name: Restart service
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          PROXY_ENV_PRODUCTION: ${{ secrets.PROXY_ENV_PRODUCTION }}
+          DEPLOY_DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: PROXY_ENV_PRODUCTION,DEPLOY_DOMAIN
+          script: |
+            cd /opt/protocol-bridge
+            if [ -n "$PROXY_ENV_PRODUCTION" ]; then
+              printf "%s" "$PROXY_ENV_PRODUCTION" > .env
+            elif [ -f .env.production ]; then
+              cp .env.production .env
+            else
+              cp .env.production.example .env
+            fi
+            npm install --production --ignore-scripts
+            # Setup SSL certificates for HTTPS/HTTP2
+            mkdir -p /opt/protocol-bridge/certs
+            ln -sf /etc/letsencrypt/live/$DEPLOY_DOMAIN/fullchain.pem /opt/protocol-bridge/certs/localhost.crt
+            ln -sf /etc/letsencrypt/live/$DEPLOY_DOMAIN/privkey.pem /opt/protocol-bridge/certs/localhost.key
+            systemctl restart protocol-bridge

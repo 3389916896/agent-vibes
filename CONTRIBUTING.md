@@ -1,0 +1,60 @@
+# Contributing
+
+Thanks for contributing to `agent-vibes`.
+
+## Branching
+
+Open pull requests against `main` unless a maintainer asks otherwise.
+
+Some legacy scripts and workflows still mention `dev` and `master`; treat those
+as repository debt, not as the current contribution target.
+
+## Development Setup
+
+```bash
+git clone https://github.com/funny-vibes/agent-vibes.git
+cd agent-vibes
+npm install
+npm run dev
+```
+
+## Required Checks
+
+Run before opening a PR:
+
+```bash
+npm run lint
+npm run types
+npm run test
+npm run build
+```
+
+## Commit Convention
+
+This repo uses Conventional Commits:
+
+- `feat:` new features
+- `fix:` bug fixes
+- `refactor:` code refactors
+- `docs:` documentation changes
+- `chore:` tooling/build/dependency updates
+
+## Pull Request Expectations
+
+- Keep PRs focused and reviewable
+- Include context in the PR description: what changed, why, and how you checked it
+- Add or update automated tests when practical
+- If no automated test is feasible, include manual verification steps
+- Update docs when user-facing behavior or configuration changes
+
+## Secret Handling
+
+Never commit real credentials, tokens, certificates, or local account files.
+
+These must stay local:
+
+- `.env`, `.env.local`
+- `apps/protocol-bridge/.env`, `apps/protocol-bridge/.env.local`
+- `apps/protocol-bridge/data/accounts.json`
+- `apps/protocol-bridge/certs/*`
+- `~/.protocol-bridge/*`
