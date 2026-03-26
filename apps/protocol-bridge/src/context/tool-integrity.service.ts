@@ -1,12 +1,25 @@
 import { Injectable, Logger } from "@nestjs/common"
 import {
+  ContentBlock,
   ToolPair,
   UnifiedMessage,
+  isTextBlock,
   isToolResultBlock,
   isToolUseBlock,
   normalizeContent,
 } from "./types"
 import { TokenCounterService } from "./token-counter.service"
+
+/**
+ * Result of sanitizeMessages operation
+ */
+export interface SanitizeResult {
+  messages: UnifiedMessage[]
+  removedOrphanToolUses: number
+  removedOrphanToolResults: number
+  removedEmptyMessages: number
+  mergedConsecutiveMessages: number
+}
 
 /**
  * Tool Integrity Service
@@ -383,5 +396,136 @@ export class ToolIntegrityService {
       targetTokens
     )
     return messages.slice(truncationIndex)
+  }
+
+  /**
+   * Sanitize messages to ensure tool protocol integrity.
+   *
+   * This is the single entry point for post-truncation repair:
+   * 1. Forward cleanup: remove tool_use blocks without matching tool_result
+   * 2. Reverse cleanup: remove tool_result blocks without matching tool_use
+   * 3. Remove messages that become empty after cleanup
+   * 4. Merge consecutive same-role messages (invalid for most backends)
+   */
+  sanitizeMessages(messages: UnifiedMessage[]): SanitizeResult {
+    if (messages.length === 0) {
+      return {
+        messages: [],
+        removedOrphanToolUses: 0,
+        removedOrphanToolResults: 0,
+        removedEmptyMessages: 0,
+        mergedConsecutiveMessages: 0,
+      }
+    }
+
+    const result: SanitizeResult = {
+      messages: messages.map((m) => ({
+        ...m,
+        content: Array.isArray(m.content) ? [...m.content] : m.content,
+        tool_calls: m.tool_calls ? [...m.tool_calls] : undefined,
+      })),
+      removedOrphanToolUses: 0,
+      removedOrphanToolResults: 0,
+      removedEmptyMessages: 0,
+      mergedConsecutiveMessages: 0,
+    }
+
+    // Collect all tool_use IDs and tool_result IDs
+    const allToolUseIds = new Set<string>()
+    const allToolResultIds = new Set<string>()
+    for (const msg of result.messages) {
+      for (const id of this.extractToolUseIds(msg)) {
+        allToolUseIds.add(id)
+      }
+      for (const id of this.extractToolResultIds(msg)) {
+        allToolResultIds.add(id)
+      }
+    }
+
+    // Forward cleanup: remove orphan tool_use (no matching tool_result)
+    for (const msg of result.messages) {
+      if (msg.role !== "assistant") continue
+
+      if (Array.isArray(msg.content)) {
+        const before = msg.content.length
+        msg.content = msg.content.filter((block: ContentBlock) => {
+          if (isToolUseBlock(block) && !allToolResultIds.has(block.id)) {
+            return false
+          }
+          return true
+        })
+        result.removedOrphanToolUses += before - msg.content.length
+      }
+
+      if (msg.tool_calls) {
+        const before = msg.tool_calls.length
+        msg.tool_calls = msg.tool_calls.filter(
+          (tc: { id?: string }) => !tc.id || allToolResultIds.has(tc.id)
+        )
+        result.removedOrphanToolUses += before - msg.tool_calls.length
+        if (msg.tool_calls.length === 0) {
+          delete msg.tool_calls
+        }
+      }
+    }
+
+    // Reverse cleanup: remove orphan tool_result (no matching tool_use)
+    for (const msg of result.messages) {
+      if (msg.role !== "user" || !Array.isArray(msg.content)) continue
+
+      const before = msg.content.length
+      msg.content = msg.content.filter((block: ContentBlock) => {
+        if (isToolResultBlock(block) && !allToolUseIds.has(block.tool_use_id)) {
+          return false
+        }
+        return true
+      })
+      result.removedOrphanToolResults += before - msg.content.length
+    }
+
+    // Also handle function-call style orphan tool_result (role=user with tool_call_id)
+    result.messages = result.messages.filter((msg) => {
+      if (msg.tool_call_id && !allToolUseIds.has(msg.tool_call_id)) {
+        result.removedOrphanToolResults++
+        return false
+      }
+      return true
+    })
+
+    // Remove empty messages
+    result.messages = result.messages.filter((msg) => {
+      const hasText =
+        typeof msg.content === "string"
+          ? msg.content.trim().length > 0
+          : Array.isArray(msg.content) &&
+            msg.content.length > 0 &&
+            msg.content.some(
+              (b) => isTextBlock(b) || isToolUseBlock(b) || isToolResultBlock(b)
+            )
+      const hasToolCalls =
+        msg.tool_calls && (msg.tool_calls as unknown[]).length > 0
+
+      if (!hasText && !hasToolCalls) {
+        result.removedEmptyMessages++
+        return false
+      }
+      return true
+    })
+
+    // Log if any changes were made
+    const totalRemoved =
+      result.removedOrphanToolUses +
+      result.removedOrphanToolResults +
+      result.removedEmptyMessages
+
+    if (totalRemoved > 0) {
+      this.logger.warn(
+        `Sanitized messages: removed ${result.removedOrphanToolUses} orphan tool_use, ` +
+          `${result.removedOrphanToolResults} orphan tool_result, ` +
+          `${result.removedEmptyMessages} empty message(s)`
+      )
+    }
+
+    return result
   }
 }

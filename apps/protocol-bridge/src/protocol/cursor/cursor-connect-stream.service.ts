@@ -5,6 +5,7 @@ import {
   ConversationTruncatorService,
   normalizeToolProtocolMessages,
   TokenCounterService,
+  ToolIntegrityService,
   UnifiedMessage,
 } from "../../context"
 import {
@@ -403,7 +404,8 @@ export class CursorConnectStreamService {
     private readonly truncator: ConversationTruncatorService,
     private readonly clientSideToolV2Executor: ClientSideToolV2ExecutorService,
     private readonly semanticSearchProvider: SemanticSearchProviderService,
-    private readonly tokenCounter: TokenCounterService
+    private readonly tokenCounter: TokenCounterService,
+    private readonly toolIntegrity: ToolIntegrityService
   ) {}
 
   /**
@@ -1047,6 +1049,16 @@ export class CursorConnectStreamService {
       this.logger.log(
         `Applied truncation (${contextLabel}): ${primary.original_token_count} -> ${primary.truncated_token_count} tokens`
       )
+
+      // Post-truncation integrity safety net: sanitize any orphaned tool blocks
+      const sanitized = this.truncator.validateIntegrity(
+        truncatedMessages as UnifiedMessage[]
+      )
+      if (sanitized.length > 0) {
+        this.logger.warn(
+          `Post-truncation integrity issues (${contextLabel}): ${sanitized.join("; ")}`
+        )
+      }
     }
 
     return truncatedMessages
@@ -1056,6 +1068,83 @@ export class CursorConnectStreamService {
     return (
       `输入内容过长，已超过 Google Cloud Code 的上下文限制（估算 ${estimatedTokens} tokens，最大 200000）。` +
       `请缩小范围或分段发送；如果是代码分析，请先指定文件路径和关键区间，我会分步读取并分析。`
+    )
+  }
+
+  /**
+   * Build a user-friendly error message for backend failures.
+   * Instead of showing "Internal Error", this gives actionable context.
+   */
+  private buildBackendErrorMessage(
+    backendLabel: string,
+    backendModel: string,
+    errorMessage: string
+  ): string {
+    const header = `⚠️ **${backendLabel} 后端请求失败** (model: ${backendModel})\n\n`
+
+    // 401 - Auth errors
+    if (
+      errorMessage.includes("401") ||
+      errorMessage.includes("API_KEY_DISABLED") ||
+      errorMessage.includes("Unauthorized") ||
+      errorMessage.includes("API key")
+    ) {
+      return (
+        header +
+        `**原因**: API Key 无效或已被禁用。\n\n` +
+        `**建议**: 请检查 \`apps/protocol-bridge/.env.local\` 中的 \`OPENAI_COMPAT_API_KEY\` 配置，` +
+        `更换有效的 Key 后重启 bridge。\n\n` +
+        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
+      )
+    }
+
+    // 429 - Rate limit
+    if (
+      errorMessage.includes("429") ||
+      errorMessage.includes("rate limit") ||
+      errorMessage.includes("Rate limit")
+    ) {
+      return (
+        header +
+        `**原因**: 请求频率超限（Rate Limit）。\n\n` +
+        `**建议**: 请稍等片刻后重试，或切换到其他后端/模型。\n\n` +
+        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
+      )
+    }
+
+    // 400 - Bad request / protocol errors
+    if (
+      errorMessage.includes("400") ||
+      errorMessage.includes("No tool output found")
+    ) {
+      return (
+        header +
+        `**原因**: 请求格式错误（可能是 tool 协议不完整）。\n\n` +
+        `**建议**: 请开启新对话重试。如果持续出现，请检查 bridge 日志。\n\n` +
+        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
+      )
+    }
+
+    // Timeout / network errors
+    if (
+      errorMessage.includes("ETIMEDOUT") ||
+      errorMessage.includes("ECONNREFUSED") ||
+      errorMessage.includes("timeout") ||
+      errorMessage.includes("fetch failed")
+    ) {
+      return (
+        header +
+        `**原因**: 网络连接失败或超时。\n\n` +
+        `**建议**: 请检查网络连接和代理配置，确认后端 API 地址可达。\n\n` +
+        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
+      )
+    }
+
+    // Generic fallback
+    return (
+      header +
+      `\`\`\`\n${errorMessage.slice(0, 300)}\n\`\`\`\n\n` +
+      `请检查 bridge 日志获取详细信息。`
     )
   }
 
@@ -6590,16 +6679,63 @@ export class CursorConnectStreamService {
       }
     } catch (error) {
       const backendLabel = route.backend
+      const errorMessage =
+        error instanceof Error ? error.message : String(error)
+
+      // Self-healing: detect "No tool output found" 400 errors caused by
+      // orphaned tool_use blocks after context truncation. Sanitize the
+      // session messages and log a warning instead of crashing.
+      if (
+        errorMessage.includes("No tool output found for function call") ||
+        errorMessage.includes("invalid_request_error")
+      ) {
+        this.logger.warn(
+          `Detected tool protocol error from ${backendLabel} backend, ` +
+            `sanitizing session messages for ${conversationId}: ${errorMessage}`
+        )
+        const session = this.sessionManager.getSession(conversationId)
+        if (session) {
+          const sanitized = this.toolIntegrity.sanitizeMessages(
+            session.messages as UnifiedMessage[]
+          )
+          if (
+            sanitized.removedOrphanToolUses > 0 ||
+            sanitized.removedOrphanToolResults > 0
+          ) {
+            this.sessionManager.replaceMessages(
+              conversationId,
+              sanitized.messages as Array<{
+                role: "user" | "assistant"
+                content: MessageContent
+              }>
+            )
+            this.logger.warn(
+              `Session sanitized: removed ${sanitized.removedOrphanToolUses} orphan tool_use, ` +
+                `${sanitized.removedOrphanToolResults} orphan tool_result. ` +
+                `Session will be clean for next retry from Cursor.`
+            )
+          }
+        }
+      }
+
       this.logger.error(
         `Error streaming from ${backendLabel} backend (cursorModel=${parsed.model}, backendModel=${backendModel})`,
         error
       )
-      // Don't throw raw error - it may contain circular references
-      const errorMessage =
-        error instanceof Error ? error.message : String(error)
-      throw new Error(
-        `${backendLabel} backend streaming failed: ${errorMessage}`
+
+      // Instead of throwing (which causes Cursor to show generic "Internal Error"),
+      // send a friendly error message as assistant text so the user sees what's wrong.
+      const friendlyMessage = this.buildBackendErrorMessage(
+        backendLabel,
+        backendModel,
+        errorMessage
       )
+      yield this.grpcService.createAgentTextResponse(friendlyMessage)
+
+      // Send heartbeat + turn ended so Cursor renders this as a normal turn
+      yield this.grpcService.createServerHeartbeatResponse()
+      yield this.grpcService.createAgentTurnEndedResponse()
+      return
     }
   }
 

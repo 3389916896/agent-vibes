@@ -4,10 +4,7 @@ import { SummaryGeneratorService } from "./summary-generator.service"
 import { TokenCounterService } from "./token-counter.service"
 import { ToolIntegrityService } from "./tool-integrity.service"
 import {
-  ContentBlock,
   DEFAULT_TRUNCATION_CONFIG,
-  isTextBlock,
-  isToolUseBlock,
   TruncationConfig,
   TruncationResult,
   UnifiedMessage,
@@ -380,7 +377,7 @@ export class ConversationTruncatorService {
       return { messages, tokenCount: 0, originalTokenCount: 0 }
     }
 
-    const fitted = [...messages]
+    let fitted = [...messages]
     const originalTokenCount = this.tokenCounter.countMessages(fitted)
     let tokenCount = originalTokenCount
 
@@ -388,115 +385,15 @@ export class ConversationTruncatorService {
     // caller should handle it as oversized user/tool input.
     while (fitted.length > 1 && tokenCount > maxTokens) {
       fitted.shift()
-      this.stripLeadingOrphanToolResultMessages(fitted)
       tokenCount = this.tokenCounter.countMessages(fitted)
     }
 
-    // After trimming, strip orphan tool_use blocks whose tool_result was
-    // removed. OpenAI Chat Completions API requires every tool_call to have
-    // a matching tool response; Codex Responses API is similarly strict.
-    this.stripOrphanToolUseContent(fitted)
+    // After trimming, use unified sanitize to clean up all orphaned
+    // tool_use/tool_result blocks in both directions.
+    const sanitized = this.toolIntegrity.sanitizeMessages(fitted)
+    fitted = sanitized.messages
+    tokenCount = this.tokenCounter.countMessages(fitted)
 
     return { messages: fitted, tokenCount, originalTokenCount }
-  }
-
-  private stripLeadingOrphanToolResultMessages(
-    messages: UnifiedMessage[]
-  ): void {
-    if (messages.length <= 1) return
-
-    while (messages.length > 1) {
-      const first = messages[0]
-      if (!first) return
-
-      const resultIds = this.toolIntegrity.extractToolResultIds(first)
-      if (resultIds.length === 0) return
-
-      const availableToolUseIds = new Set<string>()
-      for (const message of messages) {
-        for (const id of this.toolIntegrity.extractToolUseIds(message)) {
-          availableToolUseIds.add(id)
-        }
-      }
-
-      const orphaned = resultIds.filter((id) => !availableToolUseIds.has(id))
-      if (orphaned.length === 0) return
-
-      this.logger.warn(
-        `Dropping leading orphan tool_result message during hard fit: ${orphaned.join(", ")}`
-      )
-      messages.shift()
-    }
-  }
-
-  /**
-   * Strip orphan tool_use blocks from assistant messages.
-   * When context truncation removes a tool_result but keeps the matching
-   * tool_use, the resulting conversation is invalid for OpenAI-compatible
-   * APIs. This method removes the orphaned tool_use blocks (and their
-   * entire assistant message if it becomes empty).
-   */
-  private stripOrphanToolUseContent(messages: UnifiedMessage[]): void {
-    // Collect all tool_result IDs across all messages
-    const availableResultIds = new Set<string>()
-    for (const msg of messages) {
-      for (const id of this.toolIntegrity.extractToolResultIds(msg)) {
-        availableResultIds.add(id)
-      }
-    }
-
-    // Check each assistant message for orphaned tool_use blocks
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      if (!msg || msg.role !== "assistant") continue
-
-      const toolUseIds = this.toolIntegrity.extractToolUseIds(msg)
-      if (toolUseIds.length === 0) continue
-
-      const orphanIds = toolUseIds.filter((id) => !availableResultIds.has(id))
-      if (orphanIds.length === 0) continue
-
-      this.logger.warn(
-        `Stripping ${orphanIds.length} orphan tool_use block(s) from assistant message at index ${i}: ${orphanIds.join(", ")}`
-      )
-
-      // Remove orphan tool_use blocks from content array
-      if (Array.isArray(msg.content)) {
-        const orphanSet = new Set(orphanIds)
-        msg.content = msg.content.filter((block: ContentBlock) => {
-          if (isToolUseBlock(block) && orphanSet.has(block.id)) {
-            return false
-          }
-          return true
-        })
-      }
-
-      // Remove orphan entries from tool_calls field (function-call style)
-      if (msg.tool_calls) {
-        const orphanSet = new Set(orphanIds)
-        msg.tool_calls = msg.tool_calls.filter(
-          (tc: { id?: string }) => !orphanSet.has(tc.id || "")
-        )
-        if (msg.tool_calls.length === 0) {
-          delete msg.tool_calls
-        }
-      }
-
-      // If assistant message is now empty (no text, no tool_use), remove it
-      const hasText =
-        typeof msg.content === "string"
-          ? msg.content.trim().length > 0
-          : Array.isArray(msg.content) &&
-            msg.content.some((b) => isTextBlock(b) && b.text.trim())
-      const hasToolCalls =
-        msg.tool_calls && (msg.tool_calls as unknown[]).length > 0
-
-      if (!hasText && !hasToolCalls) {
-        this.logger.warn(
-          `Removing empty assistant message at index ${i} after stripping orphan tool_use blocks`
-        )
-        messages.splice(i, 1)
-      }
-    }
   }
 }

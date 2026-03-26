@@ -13,9 +13,6 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
 import * as crypto from "crypto"
-import { HttpProxyAgent } from "http-proxy-agent"
-import { HttpsProxyAgent } from "https-proxy-agent"
-import { SocksProxyAgent } from "socks-proxy-agent"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 
@@ -204,30 +201,17 @@ export class OpenaiCompatService implements OnModuleInit {
 
   // ── Proxy agent ──────────────────────────────────────────────────────
 
-  private buildProxyAgent():
-    | HttpProxyAgent<string>
-    | HttpsProxyAgent<string>
-    | SocksProxyAgent
-    | undefined {
+  private buildProxyAgent(): import("undici").ProxyAgent | undefined {
     if (!this.proxyUrl) return undefined
 
     try {
-      const url = new URL(this.proxyUrl)
-      switch (url.protocol) {
-        case "http:":
-          return new HttpProxyAgent(this.proxyUrl)
-        case "https:":
-          return new HttpsProxyAgent(this.proxyUrl)
-        case "socks5:":
-        case "socks5h:":
-        case "socks4:":
-          return new SocksProxyAgent(this.proxyUrl)
-        default:
-          this.logger.error(`Unsupported proxy scheme: ${url.protocol}`)
-          return undefined
-      }
+      // Validate the URL
+      new URL(this.proxyUrl)
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { ProxyAgent } = require("undici") as typeof import("undici")
+      return new ProxyAgent(this.proxyUrl)
     } catch (e) {
-      this.logger.error(`Failed to parse proxy URL: ${(e as Error).message}`)
+      this.logger.error(`Failed to create proxy agent: ${(e as Error).message}`)
       return undefined
     }
   }
@@ -539,14 +523,14 @@ export class OpenaiCompatService implements OnModuleInit {
     if (options?.temperature != null) body.temperature = options.temperature
     if (options?.max_tokens != null) body.max_tokens = options.max_tokens
 
-    const fetchOptions: RequestInit = {
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
       headers,
       body: JSON.stringify(body),
     }
     const agent = this.buildProxyAgent()
     if (agent) {
-      ;(fetchOptions as Record<string, unknown>).agent = agent
+      fetchOptions.dispatcher = agent
     }
 
     this.logger.log(

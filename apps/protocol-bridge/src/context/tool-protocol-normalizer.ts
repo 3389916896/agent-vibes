@@ -30,17 +30,43 @@ function extractImmediateToolUseIds(content: unknown): Set<string> {
 }
 
 /**
+ * Collect all tool_use IDs from all messages (global scan)
+ */
+function collectAllToolUseIds<T extends ToolProtocolMessage>(
+  messages: T[]
+): Set<string> {
+  const ids = new Set<string>()
+  for (const msg of messages) {
+    if (msg.role !== "assistant") continue
+    const extracted = extractImmediateToolUseIds(msg.content)
+    for (const id of extracted) {
+      ids.add(id)
+    }
+  }
+  return ids
+}
+
+/**
  * Normalize tool protocol messages for strict backends (e.g. Cloud Code):
- * - user.tool_result must map to a tool_use in the immediately previous assistant message.
+ * - user.tool_result must map to a tool_use in the conversation.
  * - invalid tool_result blocks are removed.
  * - if a user content array becomes empty after removal, it falls back to "." text.
+ *
+ * Modes:
+ * - 'strict-adjacent' (default): tool_result must match tool_use in the immediately previous assistant message.
+ * - 'global': tool_result must match any tool_use across ALL assistant messages. Use after truncation.
  */
 export function normalizeToolProtocolMessages<T extends ToolProtocolMessage>(
-  messages: T[]
+  messages: T[],
+  options?: { mode?: "strict-adjacent" | "global" }
 ): ToolProtocolNormalizationResult<T> {
   if (!Array.isArray(messages) || messages.length === 0) {
     return { messages, removedToolResults: 0, changed: false }
   }
+
+  const mode = options?.mode ?? "strict-adjacent"
+  const globalToolUseIds =
+    mode === "global" ? collectAllToolUseIds(messages) : null
 
   let removedToolResults = 0
   let changed = false
@@ -52,9 +78,11 @@ export function normalizeToolProtocolMessages<T extends ToolProtocolMessage>(
 
     const previous = normalized[normalized.length - 1]
     const allowedToolUseIds =
-      previous?.role === "assistant"
-        ? extractImmediateToolUseIds(previous.content)
-        : new Set<string>()
+      mode === "global"
+        ? globalToolUseIds!
+        : previous?.role === "assistant"
+          ? extractImmediateToolUseIds(previous.content)
+          : new Set<string>()
 
     if (message.role !== "user" || !Array.isArray(message.content)) {
       normalized.push(message)
