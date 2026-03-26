@@ -4879,17 +4879,51 @@ ${raw}
 
     if (family === "create_plan") {
       const title = this.pickFirstString(input, ["title", "name"]) || ""
-      const plan =
+
+      // LLM tool definition sends `steps: string[]`, map to plan text and todos
+      const rawSteps = Array.isArray(input.steps) ? input.steps : []
+      const stepsStrings = rawSteps
+        .map((s: unknown) => (typeof s === "string" ? s.trim() : ""))
+        .filter((s: string) => s.length > 0)
+
+      // Build plan text: prefer explicit plan/overview, then compose from steps as markdown
+      let plan =
         this.pickFirstString(input, ["plan", "overview"]) ||
         this.pickFirstString(input, ["description"]) ||
-        title
+        ""
+      if (!plan && stepsStrings.length > 0) {
+        plan = stepsStrings
+          .map((s: string, i: number) => `${i + 1}. ${s}`)
+          .join("\n")
+      }
+      if (!plan) {
+        plan = title || "Plan"
+      }
+
+      // Build todos: prefer session todos, then convert steps strings
+      let todos = this.sessionTodosToCreatePlanTodos(conversationId)
+      if (
+        (!todos || (Array.isArray(todos) && todos.length === 0)) &&
+        stepsStrings.length > 0
+      ) {
+        const nowTs = Date.now()
+        todos = stepsStrings.map((content: string, index: number) => ({
+          id: `step_${nowTs}_${index}`,
+          content,
+          status: 1, // TODO_STATUS_PENDING
+          createdAt: BigInt(nowTs),
+          updatedAt: BigInt(nowTs),
+          dependencies: [],
+        }))
+      }
+
       return this.grpcService.createInteractionQueryResponse(
         interactionQueryId,
         "createPlanRequestQuery",
         {
           args: {
-            plan: plan || title || "Plan",
-            todos: this.sessionTodosToCreatePlanTodos(conversationId),
+            plan,
+            todos,
             overview: this.pickFirstString(input, ["overview"]) || "",
             name: title,
             isProject:

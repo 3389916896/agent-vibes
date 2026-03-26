@@ -2852,9 +2852,38 @@ export class CursorGrpcService {
   private buildCreatePlanArgs(args: Record<string, unknown>) {
     const title = safeString(args.title || args.name).trim()
     const overview = safeString(args.overview || args.description).trim()
-    const plan = safeString(args.plan).trim() || overview || title || "Plan"
 
-    const todos = this.parseTodoItemsForProto(args.todos)
+    // LLM tool definition sends `steps: string[]`, map them to both plan text and todos
+    const rawSteps = Array.isArray(args.steps) ? args.steps : []
+    const stepsStrings = rawSteps
+      .map((s) => (typeof s === "string" ? s.trim() : ""))
+      .filter((s) => s.length > 0)
+
+    // Build plan text: prefer explicit plan, then compose from steps as markdown
+    let plan = safeString(args.plan).trim()
+    if (!plan && stepsStrings.length > 0) {
+      plan = stepsStrings.map((s, i) => `${i + 1}. ${s}`).join("\n")
+    }
+    if (!plan) {
+      plan = overview || title || "Plan"
+    }
+
+    // Build todos: prefer explicit todos, fallback to converting steps strings
+    let todos = this.parseTodoItemsForProto(args.todos)
+    if (todos.length === 0 && stepsStrings.length > 0) {
+      const nowTs = Date.now()
+      todos = stepsStrings.map((content, index) =>
+        create(TodoItemSchema, {
+          id: `step_${nowTs}_${index}`,
+          content,
+          status: 1, // TODO_STATUS_PENDING
+          createdAt: BigInt(nowTs),
+          updatedAt: BigInt(nowTs),
+          dependencies: [],
+        })
+      )
+    }
+
     const phases = this.parsePhasesForProto(args.phases)
 
     return create(CreatePlanArgsSchema, {

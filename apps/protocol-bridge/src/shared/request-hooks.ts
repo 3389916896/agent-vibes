@@ -18,12 +18,14 @@ export function registerRequestHooks(
 
       // Log ALL proto requests for debugging routing issues
       if (ct.includes("proto") || ct.includes("connect")) {
-        logger.log(`[ALL-PROTO] ${request.method} ${url} - Content-Type: ${ct}`)
+        logger.debug(
+          `[ALL-PROTO] ${request.method} ${url} - Content-Type: ${ct}`
+        )
       }
 
       // Log Cursor gRPC requests (agent only)
       if (url.includes("agent.v1")) {
-        logger.log(
+        logger.debug(
           `[Cursor gRPC] ${request.method} ${url} - Content-Type: ${request.headers["content-type"]}`
         )
 
@@ -51,7 +53,7 @@ export function registerRequestHooks(
 
       // Log Claude CLI requests
       if (url.includes("/v1/messages")) {
-        logger.log(
+        logger.debug(
           `[Claude CLI] ${request.method} ${url} - Content-Type: ${request.headers["content-type"]}`
         )
       }

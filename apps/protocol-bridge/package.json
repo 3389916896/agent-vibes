@@ -8,7 +8,7 @@
     "dev": "nest start --watch",
     "start": "node dist/main",
     "start:dev": "npm run dev",
-    "start:debug": "nest start --debug --watch",
+    "start:debug": "LOG_DEBUG=true node dist/main",
     "start:prod": "node dist/main",
     "format": "prettier --check \"src/**/*.{js,ts}\"",
     "format:fix": "prettier --write \"src/**/*.{js,ts}\"",

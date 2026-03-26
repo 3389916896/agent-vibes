@@ -17,6 +17,7 @@
     "TURBO_REMOTE_ONLY",
     "PORT",
     "PROXY_API_KEY",
+    "LOG_DEBUG",
     "KIRO_CREDS_FILE",
     "KIRO_REGION",
     "ANTIGRAVITY_STORAGE"
@@ -67,6 +68,11 @@
       "outputLogs": "new-only"
     },
     "start": {
+      "dependsOn": ["build"],
+      "cache": false,
+      "persistent": true
+    },
+    "start:debug": {
       "dependsOn": ["build"],
       "cache": false,
       "persistent": true

@@ -1,5 +1,10 @@
 import fastifyCors from "@fastify/cors"
-import { BadRequestException, Logger, ValidationPipe } from "@nestjs/common"
+import {
+  BadRequestException,
+  Logger,
+  type LogLevel,
+  ValidationPipe,
+} from "@nestjs/common"
 import { NestFactory } from "@nestjs/core"
 import {
   FastifyAdapter,
@@ -13,9 +18,15 @@ import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
 
 async function bootstrap() {
-  // ── Auto File Logging ──────────────────────────────────────────────
-  // Mirror all stdout/stderr to .log/agent.log so that `npm run issues`
-  // always has logs to collect, without requiring manual `| tee`.
+  // ── Debug Mode ─────────────────────────────────────────────────────
+  // npm run start       → quiet (warn + error only, no file tee)
+  // npm run start:debug → verbose (all levels + full file logging)
+  const isDebug = process.env.LOG_DEBUG === "true"
+  const nestLogLevels: LogLevel[] = isDebug
+    ? ["verbose", "debug", "log", "warn", "error"]
+    : ["warn", "error"]
+
+  // ── File Logging (debug mode only) ─────────────────────────────────
   const logDir = path.join(__dirname, "..", "..", "..", ".log")
   fs.mkdirSync(logDir, { recursive: true })
 
@@ -34,53 +45,56 @@ async function bootstrap() {
   } catch {
     fs.copyFileSync(logFilePath, latestLogPath)
   }
-  const timestamp = () => new Date().toISOString()
 
-  // Write startup marker
   logStream.write(
-    `\n${"=".repeat(60)}\n[${timestamp()}] Agent Vibes server starting\n${"=".repeat(60)}\n`
+    `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Agent Vibes server starting (debug=${isDebug})\n${"=".repeat(60)}\n`
   )
 
   const origStdoutWrite = process.stdout.write.bind(process.stdout)
   const origStderrWrite = process.stderr.write.bind(process.stderr)
 
-  // Only log warnings, errors, and stack traces to the file
-  const ISSUE_LOG_PATTERN = /\b(WARN|ERROR|Error|Exception|FATAL|reject|fail)/i
-  const STACK_TRACE_PATTERN = /^\s+at\s/
-  let lastLineWasError = false
+  if (isDebug) {
+    // Debug: tee ALL stdout to log file
+    process.stdout.write = ((
+      chunk: string | Uint8Array,
+      ...args: unknown[]
+    ): boolean => {
+      logStream.write(chunk)
+      return origStdoutWrite(chunk, ...(args as []))
+    }) as typeof process.stdout.write
+  } else {
+    // Normal: only capture warnings/errors/stack traces to log file
+    const ISSUE_PATTERN = /\b(WARN|ERROR|Error|Exception|FATAL|reject|fail)/i
+    const STACK_PATTERN = /^\s+at\s/
+    let lastWasError = false
 
-  const shouldLog = (text: string): boolean => {
-    if (ISSUE_LOG_PATTERN.test(text)) {
-      lastLineWasError = true
-      return true
-    }
-    // Capture stack trace lines that follow errors
-    if (lastLineWasError && STACK_TRACE_PATTERN.test(text)) {
-      return true
-    }
-    lastLineWasError = false
-    return false
+    process.stdout.write = ((
+      chunk: string | Uint8Array,
+      ...args: unknown[]
+    ): boolean => {
+      const text =
+        typeof chunk === "string" ? chunk : Buffer.from(chunk).toString()
+      if (ISSUE_PATTERN.test(text)) {
+        lastWasError = true
+        logStream.write(chunk)
+      } else if (lastWasError && STACK_PATTERN.test(text)) {
+        logStream.write(chunk)
+      } else {
+        lastWasError = false
+      }
+      return origStdoutWrite(chunk, ...(args as []))
+    }) as typeof process.stdout.write
   }
 
-  process.stdout.write = ((
-    chunk: string | Uint8Array,
-    ...args: unknown[]
-  ): boolean => {
-    const text =
-      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString()
-    if (shouldLog(text)) logStream.write(chunk)
-    return origStdoutWrite(chunk, ...(args as []))
-  }) as typeof process.stdout.write
-
+  // stderr always goes to log file (crash diagnostics)
   process.stderr.write = ((
     chunk: string | Uint8Array,
     ...args: unknown[]
   ): boolean => {
-    // stderr is always relevant for diagnostics
     logStream.write(chunk)
     return origStderrWrite(chunk, ...(args as []))
   }) as typeof process.stderr.write
-  // ── End Auto File Logging ──────────────────────────────────────────
+  // ── End File Logging ───────────────────────────────────────────────
 
   const logger = new Logger("Bootstrap")
 
@@ -128,7 +142,8 @@ async function bootstrap() {
   // Create NestJS application
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
-    fastifyAdapter
+    fastifyAdapter,
+    { logger: nestLogLevels }
   )
   app.enableShutdownHooks()
 
@@ -239,6 +254,7 @@ ${empty}
 ${line(`${c.green}▸${c.reset} Server    ${c.bold}${c.green}${serverUrl}${c.reset}`)}
 ${line(`${c.green}▸${c.reset} API Docs  ${c.bold}${c.green}${serverUrl}/docs${c.reset}`)}
 ${line(`${c.green}▸${c.reset} HTTP/2    ${c.bold}${c.white}${http2Status}${c.reset}`)}
+${line(`${c.green}▸${c.reset} Mode      ${c.bold}${c.white}${isDebug ? "DEBUG (verbose + file log)" : "NORMAL (quiet)"}${c.reset}`)}
 ${empty}
 ${line(`${c.orange}${c.bold}Anthropic API${c.reset} ${c.dim}(Claude Code CLI)${c.reset}`)}
 ${line(`  ${c.purple}POST${c.reset} /v1/messages ${c.dim}·· Anthropic Messages API${c.reset}`)}

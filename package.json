@@ -34,6 +34,7 @@
     "release": "git pull && git push origin dev && git checkout master && git pull && git merge dev --no-edit && git push && git checkout dev && echo '' && echo 'Released! Check Actions for deployment status.'",
     "build": "turbo run build",
     "start": "turbo run start",
+    "start:debug": "turbo run start:debug",
     "test": "turbo run test",
     "format": "prettier --check \"**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,json,md,yml,yaml}\"",
     "format:fix": "prettier --write \"**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,json,md,yml,yaml}\"",

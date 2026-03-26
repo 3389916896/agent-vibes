@@ -40,7 +40,6 @@ export function validateEnv(
   const errors: string[] = []
 
   if (!env.PORT) env.PORT = "8000"
-  if (!env.LOG_LEVEL) env.LOG_LEVEL = "log"
   if (!env.USE_HTTP2) env.USE_HTTP2 = "true"
 
   // Codex env vars are optional strings; no validation needed beyond presence.
